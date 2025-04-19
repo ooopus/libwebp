@@ -1,0 +1,39 @@
+name: Build DLL (Windows)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-dll:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CMake
+        uses: lukka/get-cmake@v4.0.1
+
+      - name: Configure CMake (DLL)
+        run: |
+          cmake -S . -B build -A x64 -DBUILD_SHARED_LIBS=ON
+
+      - name: Build DLL
+        run: |
+          cmake --build build --config Release
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebp-dll
+          path: |
+            build/Release/*.dll
+            build/Release/*.lib
+            build/Release/*.pdb
