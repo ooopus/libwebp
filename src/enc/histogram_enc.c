@@ -52,20 +52,32 @@ static int GetHistogramSize(int cache_bits) {
   return (int)total_size;
 }
 
-static void HistogramClear(VP8LHistogram* const p) {
-  uint32_t* const literal = p->literal;
-  const int cache_bits = p->palette_code_bits;
+static void HistogramStatsClear(VP8LHistogram* const h) {
+  int i;
+  for (i = 0; i < 5; ++i) {
+    h->trivial_symbol[i] = VP8L_NON_TRIVIAL_SYM;
+    // By default, the histogram is assumed to be used.
+    h->is_used[i] = 1;
+  }
+  h->bit_cost = 0;
+  memset(h->costs, 0, sizeof(h->costs));
+}
+
+static void HistogramClear(VP8LHistogram* const h) {
+  uint32_t* const literal = h->literal;
+  const int cache_bits = h->palette_code_bits;
   const int histo_size = GetHistogramSize(cache_bits);
-  memset(p, 0, histo_size);
-  p->palette_code_bits = cache_bits;
-  p->literal = literal;
+  memset(h, 0, histo_size);
+  h->palette_code_bits = cache_bits;
+  h->literal = literal;
+  HistogramStatsClear(h);
 }
 
 // Swap two histogram pointers.
-static void HistogramSwap(VP8LHistogram** const A, VP8LHistogram** const B) {
-  VP8LHistogram* const tmp = *A;
-  *A = *B;
-  *B = tmp;
+static void HistogramSwap(VP8LHistogram** const h1, VP8LHistogram** const h2) {
+  VP8LHistogram* const tmp = *h1;
+  *h1 = *h2;
+  *h2 = tmp;
 }
 
 static void HistogramCopy(const VP8LHistogram* const src,
@@ -80,36 +92,30 @@ static void HistogramCopy(const VP8LHistogram* const src,
   memcpy(dst->literal, src->literal, literal_size * sizeof(*dst->literal));
 }
 
-void VP8LFreeHistogram(VP8LHistogram* const histo) {
-  WebPSafeFree(histo);
+void VP8LFreeHistogram(VP8LHistogram* const h) { WebPSafeFree(h); }
+
+void VP8LFreeHistogramSet(VP8LHistogramSet* const histograms) {
+  WebPSafeFree(histograms);
 }
 
-void VP8LFreeHistogramSet(VP8LHistogramSet* const histo) {
-  WebPSafeFree(histo);
-}
-
-void VP8LHistogramCreate(VP8LHistogram* const p,
+void VP8LHistogramCreate(VP8LHistogram* const h,
                          const VP8LBackwardRefs* const refs,
                          int palette_code_bits) {
   if (palette_code_bits >= 0) {
-    p->palette_code_bits = palette_code_bits;
+    h->palette_code_bits = palette_code_bits;
   }
-  HistogramClear(p);
+  HistogramClear(h);
   VP8LHistogramStoreRefs(refs, /*distance_modifier=*/NULL,
-                         /*distance_modifier_arg0=*/0, p);
+                         /*distance_modifier_arg0=*/0, h);
 }
 
-void VP8LHistogramInit(VP8LHistogram* const p, int palette_code_bits,
+void VP8LHistogramInit(VP8LHistogram* const h, int palette_code_bits,
                        int init_arrays) {
-  p->palette_code_bits = palette_code_bits;
+  h->palette_code_bits = palette_code_bits;
   if (init_arrays) {
-    HistogramClear(p);
+    HistogramClear(h);
   } else {
-    int i;
-    for (i = 0; i < 5; ++i) p->trivial_symbol[i] = VP8L_NON_TRIVIAL_SYM;
-    p->bit_cost = 0;
-    memset(p->costs, 0, sizeof(p->costs));
-    memset(p->is_used, 0, sizeof(p->is_used));
+    HistogramStatsClear(h);
   }
 }
 
@@ -185,18 +191,11 @@ void VP8LHistogramSetClear(VP8LHistogramSet* const set) {
   }
 }
 
-// Removes the histogram 'i' from 'set' by setting it to NULL.
-static void HistogramSetRemoveHistogram(VP8LHistogramSet* const set, int i,
-                                        int* const num_used) {
-  assert(set->histograms[i] != NULL);
-  set->histograms[i] = NULL;
-  --*num_used;
-  // If we remove the last valid one, shrink until the next valid one.
-  if (i == set->size - 1) {
-    while (set->size >= 1 && set->histograms[set->size - 1] == NULL) {
-      --set->size;
-    }
-  }
+// Removes the histogram 'i' from 'set'.
+static void HistogramSetRemoveHistogram(VP8LHistogramSet* const set, int i) {
+  set->histograms[i] = set->histograms[set->size - 1];
+  --set->size;
+  assert(set->size > 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -327,8 +326,10 @@ static uint64_t PopulationCost(const uint32_t* const population, int length,
     *trivial_sym = (bit_entropy.nonzeros == 1) ? bit_entropy.nonzero_code
                                                : VP8L_NON_TRIVIAL_SYM;
   }
-  // The histogram is used if there is at least one non-zero streak.
-  *is_used = (stats.streaks[1][0] != 0 || stats.streaks[1][1] != 0);
+  if (is_used != NULL) {
+    // The histogram is used if there is at least one non-zero streak.
+    *is_used = (stats.streaks[1][0] != 0 || stats.streaks[1][1] != 0);
+  }
 
   return BitsEntropyRefine(&bit_entropy) + FinalHuffmanCost(&stats);
 }
@@ -365,45 +366,47 @@ static WEBP_INLINE void GetPopulationInfo(const VP8LHistogram* const histo,
 // non-zero: both the zero-th one, or both the last one.
 // 'index' is the index of the symbol in the histogram (literal, red, blue,
 // alpha, distance).
-static WEBP_INLINE uint64_t
-GetCombinedEntropy(const VP8LHistogram* const histo_X,
-                   const VP8LHistogram* const histo_Y, HistogramIndex index) {
+static WEBP_INLINE uint64_t GetCombinedEntropy(const VP8LHistogram* const h1,
+                                               const VP8LHistogram* const h2,
+                                               HistogramIndex index) {
   const uint32_t* X;
   const uint32_t* Y;
   int length;
   VP8LStreaks stats;
   VP8LBitEntropy bit_entropy;
-  const int is_X_used = histo_X->is_used[index];
-  const int is_Y_used = histo_Y->is_used[index];
-  const int is_trivial =
-      histo_X->trivial_symbol[index] != VP8L_NON_TRIVIAL_SYM &&
-      histo_X->trivial_symbol[index] == histo_Y->trivial_symbol[index];
+  const int is_h1_used = h1->is_used[index];
+  const int is_h2_used = h2->is_used[index];
+  const int is_trivial = h1->trivial_symbol[index] != VP8L_NON_TRIVIAL_SYM &&
+                         h1->trivial_symbol[index] == h2->trivial_symbol[index];
 
-  if (is_trivial || !is_X_used || !is_Y_used) {
-    if (is_X_used) return histo_X->costs[index];
-    return histo_Y->costs[index];
+  if (is_trivial || !is_h1_used || !is_h2_used) {
+    if (is_h1_used) return h1->costs[index];
+    return h2->costs[index];
   }
-  assert(is_X_used && is_Y_used);
+  assert(is_h1_used && is_h2_used);
 
-  GetPopulationInfo(histo_X, index, &X, &length);
-  GetPopulationInfo(histo_Y, index, &Y, &length);
+  GetPopulationInfo(h1, index, &X, &length);
+  GetPopulationInfo(h2, index, &Y, &length);
   VP8LGetCombinedEntropyUnrefined(X, Y, length, &bit_entropy, &stats);
   return BitsEntropyRefine(&bit_entropy) + FinalHuffmanCost(&stats);
 }
 
 // Estimates the Entropy + Huffman + other block overhead size cost.
-uint64_t VP8LHistogramEstimateBits(VP8LHistogram* const p) {
-  return PopulationCost(p->literal, VP8LHistogramNumCodes(p->palette_code_bits),
-                        NULL, &p->is_used[LITERAL]) +
-         PopulationCost(p->red, NUM_LITERAL_CODES, NULL, &p->is_used[RED]) +
-         PopulationCost(p->blue, NUM_LITERAL_CODES, NULL, &p->is_used[BLUE]) +
-         PopulationCost(p->alpha, NUM_LITERAL_CODES, NULL, &p->is_used[ALPHA]) +
-         PopulationCost(p->distance, NUM_DISTANCE_CODES, NULL,
-                        &p->is_used[DISTANCE]) +
-         ((uint64_t)(VP8LExtraCost(p->literal + NUM_LITERAL_CODES,
-                                   NUM_LENGTH_CODES) +
-                     VP8LExtraCost(p->distance, NUM_DISTANCE_CODES))
-          << LOG_2_PRECISION_BITS);
+uint64_t VP8LHistogramEstimateBits(const VP8LHistogram* const h) {
+  int i;
+  uint64_t cost = 0;
+  for (i = 0; i < 5; ++i) {
+    int length;
+    const uint32_t* population;
+    GetPopulationInfo(h, (HistogramIndex)i, &population, &length);
+    cost += PopulationCost(population, length, /*trivial_sym=*/NULL,
+                           /*is_used=*/NULL);
+  }
+  cost += ((uint64_t)(VP8LExtraCost(h->literal + NUM_LITERAL_CODES,
+                                    NUM_LENGTH_CODES) +
+                      VP8LExtraCost(h->distance, NUM_DISTANCE_CODES))
+           << LOG_2_PRECISION_BITS);
+  return cost;
 }
 
 // -----------------------------------------------------------------------------
@@ -440,15 +443,57 @@ WEBP_NODISCARD static int GetCombinedHistogramEntropy(
   return 1;
 }
 
-static WEBP_INLINE void HistogramAdd(const VP8LHistogram* const a,
-                                     const VP8LHistogram* const b,
-                                     VP8LHistogram* const out) {
+static WEBP_INLINE void HistogramAdd(const VP8LHistogram* const h1,
+                                     const VP8LHistogram* const h2,
+                                     VP8LHistogram* const hout) {
   int i;
-  VP8LHistogramAdd(a, b, out);
+  assert(h1->palette_code_bits == h2->palette_code_bits);
+
   for (i = 0; i < 5; ++i) {
-    out->trivial_symbol[i] = a->trivial_symbol[i] == b->trivial_symbol[i]
-                                 ? a->trivial_symbol[i]
-                                 : VP8L_NON_TRIVIAL_SYM;
+    int length;
+    const uint32_t *p1, *p2, *pout_const;
+    uint32_t* pout;
+    GetPopulationInfo(h1, (HistogramIndex)i, &p1, &length);
+    GetPopulationInfo(h2, (HistogramIndex)i, &p2, &length);
+    GetPopulationInfo(hout, (HistogramIndex)i, &pout_const, &length);
+    pout = (uint32_t*)pout_const;
+    if (h2 == hout) {
+      if (h1->is_used[i]) {
+        if (hout->is_used[i]) {
+          VP8LAddVectorEq(p1, pout, length);
+        } else {
+          memcpy(pout, p1, length * sizeof(pout[0]));
+        }
+      }
+    } else {
+      if (h1->is_used[i]) {
+        if (h2->is_used[i]) {
+          VP8LAddVector(p1, p2, pout, length);
+        } else {
+          memcpy(pout, p1, length * sizeof(pout[0]));
+        }
+      } else if (h2->is_used[i]) {
+        memcpy(pout, p2, length * sizeof(pout[0]));
+      } else {
+        memset(pout, 0, length * sizeof(pout[0]));
+      }
+    }
+  }
+
+  for (i = 0; i < 5; ++i) {
+    hout->trivial_symbol[i] = h1->trivial_symbol[i] == h2->trivial_symbol[i]
+                                  ? h1->trivial_symbol[i]
+                                  : VP8L_NON_TRIVIAL_SYM;
+    hout->is_used[i] = h1->is_used[i] || h2->is_used[i];
+  }
+}
+
+static void UpdateHistogramCost(uint64_t bit_cost, uint64_t costs[5],
+                                VP8LHistogram* const h) {
+  int i;
+  h->bit_cost = bit_cost;
+  for (i = 0; i < 5; ++i) {
+    h->costs[i] = costs[i];
   }
 }
 
@@ -465,14 +510,14 @@ WEBP_NODISCARD static int HistogramAddEval(const VP8LHistogram* const a,
                                            VP8LHistogram* const out,
                                            int64_t cost_threshold) {
   const uint64_t sum_cost = a->bit_cost + b->bit_cost;
+  uint64_t bit_cost, costs[5];
   SaturateAdd(sum_cost, &cost_threshold);
-  if (!GetCombinedHistogramEntropy(a, b, cost_threshold, &out->bit_cost,
-                                   out->costs)) {
+  if (!GetCombinedHistogramEntropy(a, b, cost_threshold, &bit_cost, costs)) {
     return 0;
   }
 
   HistogramAdd(a, b, out);
-  out->palette_code_bits = a->palette_code_bits;
+  UpdateHistogramCost(bit_cost, costs, out);
   return 1;
 }
 
@@ -528,7 +573,7 @@ static void UpdateDominantCostRange(
   if (c->blue_min > h->costs[BLUE]) c->blue_min = h->costs[BLUE];
 }
 
-static void UpdateHistogramCost(VP8LHistogram* const h) {
+static void ComputeHistogramCost(VP8LHistogram* const h) {
   int i;
   // No need to add the extra cost for length and distance as it is a constant
   // that does not influence the histograms.
@@ -593,8 +638,7 @@ static void HistogramBuild(
 
 // Copies the histograms and computes its bit_cost.
 static void HistogramCopyAndAnalyze(VP8LHistogramSet* const orig_histo,
-                                    VP8LHistogramSet* const image_histo,
-                                    int* const num_used) {
+                                    VP8LHistogramSet* const image_histo) {
   int i;
   VP8LHistogram** const orig_histograms = orig_histo->histograms;
   VP8LHistogram** const histograms = image_histo->histograms;
@@ -602,7 +646,7 @@ static void HistogramCopyAndAnalyze(VP8LHistogramSet* const orig_histo,
   image_histo->size = 0;
   for (i = 0; i < orig_histo->max_size; ++i) {
     VP8LHistogram* const histo = orig_histograms[i];
-    UpdateHistogramCost(histo);
+    ComputeHistogramCost(histo);
 
     // Skip the histogram if it is completely empty, which can happen for tiles
     // with no information (when they are skipped because of LZ77).
@@ -612,7 +656,6 @@ static void HistogramCopyAndAnalyze(VP8LHistogramSet* const orig_histo,
       // The first histogram is always used.
       assert(i > 0);
       orig_histograms[i] = NULL;
-      --*num_used;
     } else {
       // Copy histograms from orig_histo[] to image_histo[].
       HistogramCopy(histo, histograms[image_histo->size]);
@@ -648,8 +691,7 @@ static void HistogramAnalyzeEntropyBin(VP8LHistogramSet* const image_histo,
 // Sets the remaining histograms to NULL.
 // 'combine_cost_factor' has to be divided by 100.
 static void HistogramCombineEntropyBin(VP8LHistogramSet* const image_histo,
-                                       int* num_used, VP8LHistogram* cur_combo,
-                                       int num_bins,
+                                       VP8LHistogram* cur_combo, int num_bins,
                                        int32_t combine_cost_factor,
                                        int low_effort) {
   VP8LHistogram** const histograms = image_histo->histograms;
@@ -666,14 +708,15 @@ static void HistogramCombineEntropyBin(VP8LHistogramSet* const image_histo,
     bin_info[idx].num_combine_failures = 0;
   }
 
-  for (idx = 0; idx < image_histo->size; ++idx) {
+  for (idx = 0; idx < image_histo->size;) {
     const int bin_id = histograms[idx]->bin_id;
     const int first = bin_info[bin_id].first;
     if (first == -1) {
       bin_info[bin_id].first = idx;
+      ++idx;
     } else if (low_effort) {
       HistogramAdd(histograms[idx], histograms[first], histograms[first]);
-      HistogramSetRemoveHistogram(image_histo, idx, num_used);
+      HistogramSetRemoveHistogram(image_histo, idx);
     } else {
       // try to merge #idx into #first (both share the same bin_id)
       const uint64_t bit_cost = histograms[idx]->bit_cost;
@@ -705,18 +748,20 @@ static void HistogramCombineEntropyBin(VP8LHistogramSet* const image_histo,
             bin_info[bin_id].num_combine_failures >= max_combine_failures) {
           // move the (better) merged histogram to its final slot
           HistogramSwap(&cur_combo, &histograms[first]);
-          HistogramSetRemoveHistogram(image_histo, idx, num_used);
+          HistogramSetRemoveHistogram(image_histo, idx);
         } else {
           ++bin_info[bin_id].num_combine_failures;
+          ++idx;
         }
+      } else {
+        ++idx;
       }
     }
   }
   if (low_effort) {
     // for low_effort case, update the final cost when everything is merged
     for (idx = 0; idx < image_histo->size; ++idx) {
-      if (histograms[idx] == NULL) continue;
-      UpdateHistogramCost(histograms[idx]);
+      ComputeHistogramCost(histograms[idx]);
     }
   }
 }
@@ -790,6 +835,18 @@ static void HistoQueueUpdateHead(HistoQueue* const histo_queue,
   }
 }
 
+// Replaces the bad_id with good_id in the pair.
+static void HistoQueueFixPair(int bad_id, int good_id,
+                              HistogramPair* const pair) {
+  if (pair->idx1 == bad_id) pair->idx1 = good_id;
+  if (pair->idx2 == bad_id) pair->idx2 = good_id;
+  if (pair->idx1 > pair->idx2) {
+    const int tmp = pair->idx1;
+    pair->idx1 = pair->idx2;
+    pair->idx2 = tmp;
+  }
+}
+
 // Update the cost diff and combo of a pair of histograms. This needs to be
 // called when the histograms have been merged with a third one.
 // Returns 1 if the cost diff is less than the threshold.
@@ -844,8 +901,7 @@ static int64_t HistoQueuePush(HistoQueue* const histo_queue,
 
 // Combines histograms by continuously choosing the one with the highest cost
 // reduction.
-static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo,
-                                  int* const num_used) {
+static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo) {
   int ok = 0;
   const int image_histo_size = image_histo->size;
   int i, j;
@@ -864,11 +920,9 @@ static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo,
     goto End;
   }
 
+  // Initialize the queue.
   for (i = 0; i < image_histo_size; ++i) {
-    if (image_histo->histograms[i] == NULL) continue;
     for (j = i + 1; j < image_histo_size; ++j) {
-      // Initialize queue.
-      if (image_histo->histograms[j] == NULL) continue;
       HistoQueuePush(&histo_queue, histograms, i, j, 0);
     }
   }
@@ -877,12 +931,11 @@ static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo,
     const int idx1 = histo_queue.queue[0].idx1;
     const int idx2 = histo_queue.queue[0].idx2;
     HistogramAdd(histograms[idx2], histograms[idx1], histograms[idx1]);
-    histograms[idx1]->bit_cost = histo_queue.queue[0].cost_combo;
-    memcpy(histograms[idx1]->costs, histo_queue.queue[0].costs,
-           sizeof(histograms[idx1]->costs));
+    UpdateHistogramCost(histo_queue.queue[0].cost_combo,
+                        histo_queue.queue[0].costs, histograms[idx1]);
 
     // Remove merged histogram.
-    HistogramSetRemoveHistogram(image_histo, idx2, num_used);
+    HistogramSetRemoveHistogram(image_histo, idx2);
 
     // Remove pairs intersecting the just combined best pair.
     for (i = 0; i < histo_queue.size;) {
@@ -891,6 +944,7 @@ static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo,
           p->idx1 == idx2 || p->idx2 == idx2) {
         HistoQueuePopPair(&histo_queue, p);
       } else {
+        HistoQueueFixPair(image_histo->size, idx2, p);
         HistoQueueUpdateHead(&histo_queue, p);
         ++i;
       }
@@ -898,7 +952,7 @@ static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo,
 
     // Push new pairs formed with combined histogram to the queue.
     for (i = 0; i < image_histo->size; ++i) {
-      if (i == idx1 || image_histo->histograms[i] == NULL) continue;
+      if (i == idx1) continue;
       HistoQueuePush(&histo_queue, image_histo->histograms, idx1, i, 0);
     }
   }
@@ -913,17 +967,13 @@ static int HistogramCombineGreedy(VP8LHistogramSet* const image_histo,
 // Perform histogram aggregation using a stochastic approach.
 // 'do_greedy' is set to 1 if a greedy approach needs to be performed
 // afterwards, 0 otherwise.
-static int PairComparison(const void* idx1, const void* idx2) {
-  // To be used with bsearch: <0 when *idx1<*idx2, >0 if >, 0 when ==.
-  return (*(int*) idx1 - *(int*) idx2);
-}
 static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
-                                      int* const num_used, int min_cluster_size,
+                                      int min_cluster_size,
                                       int* const do_greedy) {
   int j, iter;
   uint32_t seed = 1;
   int tries_with_no_success = 0;
-  const int outer_iters = *num_used;
+  const int outer_iters = image_histo->size;
   const int num_tries_no_success = outer_iters / 2;
   VP8LHistogram** const histograms = image_histo->histograms;
   // Priority queue of histogram pairs. Its size of 'kHistoQueueSize'
@@ -932,49 +982,34 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
   HistoQueue histo_queue;
   const int kHistoQueueSize = 9;
   int ok = 0;
-  // mapping from an index in image_histo with no NULL histogram to the full
-  // blown image_histo.
-  int* mappings;
 
-  if (*num_used < min_cluster_size) {
+  if (image_histo->size < min_cluster_size) {
     *do_greedy = 1;
     return 1;
   }
 
-  mappings = (int*) WebPSafeMalloc(*num_used, sizeof(*mappings));
-  if (mappings == NULL) return 0;
   if (!HistoQueueInit(&histo_queue, kHistoQueueSize)) goto End;
-  // Fill the initial mapping.
-  for (j = 0, iter = 0; iter < image_histo->size; ++iter) {
-    if (histograms[iter] == NULL) continue;
-    mappings[j++] = iter;
-  }
-  assert(j == *num_used);
 
   // Collapse similar histograms in 'image_histo'.
-  for (iter = 0;
-       iter < outer_iters && *num_used >= min_cluster_size &&
-           ++tries_with_no_success < num_tries_no_success;
-       ++iter) {
-    int* mapping_index;
+  for (iter = 0; iter < outer_iters && image_histo->size >= min_cluster_size &&
+                ++tries_with_no_success < num_tries_no_success;
+      ++iter) {
     int64_t best_cost =
         (histo_queue.size == 0) ? 0 : histo_queue.queue[0].cost_diff;
     int best_idx1 = -1, best_idx2 = 1;
-    const uint32_t rand_range = (*num_used - 1) * (*num_used);
-    // (*num_used) / 2 was chosen empirically. Less means faster but worse
-    // compression.
-    const int num_tries = (*num_used) / 2;
+    const uint32_t rand_range = (image_histo->size - 1) * (image_histo->size);
+    // (image_histo->size) / 2 was chosen empirically. Less means faster but
+    // worse compression.
+    const int num_tries = (image_histo->size) / 2;
 
     // Pick random samples.
-    for (j = 0; *num_used >= 2 && j < num_tries; ++j) {
+    for (j = 0; image_histo->size >= 2 && j < num_tries; ++j) {
       int64_t curr_cost;
       // Choose two different histograms at random and try to combine them.
       const uint32_t tmp = MyRand(&seed) % rand_range;
-      uint32_t idx1 = tmp / (*num_used - 1);
-      uint32_t idx2 = tmp % (*num_used - 1);
+      uint32_t idx1 = tmp / (image_histo->size - 1);
+      uint32_t idx2 = tmp % (image_histo->size - 1);
       if (idx2 >= idx1) ++idx2;
-      idx1 = mappings[idx1];
-      idx2 = mappings[idx2];
 
       // Calculate cost reduction on combination.
       curr_cost =
@@ -991,26 +1026,18 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
     best_idx1 = histo_queue.queue[0].idx1;
     best_idx2 = histo_queue.queue[0].idx2;
     assert(best_idx1 < best_idx2);
-    // Pop best_idx2 from mappings.
-    mapping_index = (int*) bsearch(&best_idx2, mappings, *num_used,
-                                   sizeof(best_idx2), &PairComparison);
-    assert(mapping_index != NULL);
-    memmove(mapping_index, mapping_index + 1, sizeof(*mapping_index) *
-        ((*num_used) - (mapping_index - mappings) - 1));
     // Merge the histograms and remove best_idx2 from the queue.
     HistogramAdd(histograms[best_idx2], histograms[best_idx1],
                  histograms[best_idx1]);
-    histograms[best_idx1]->bit_cost = histo_queue.queue[0].cost_combo;
-    memcpy(histograms[best_idx1]->costs, histo_queue.queue[0].costs,
-           sizeof(histograms[best_idx1]->costs));
-    HistogramSetRemoveHistogram(image_histo, best_idx2, num_used);
+    UpdateHistogramCost(histo_queue.queue[0].cost_combo,
+                        histo_queue.queue[0].costs, histograms[best_idx1]);
+    HistogramSetRemoveHistogram(image_histo, best_idx2);
     // Parse the queue and update each pair that deals with best_idx1,
     // best_idx2 or image_histo_size.
     for (j = 0; j < histo_queue.size;) {
       HistogramPair* const p = histo_queue.queue + j;
       const int is_idx1_best = p->idx1 == best_idx1 || p->idx1 == best_idx2;
       const int is_idx2_best = p->idx2 == best_idx1 || p->idx2 == best_idx2;
-      int do_eval = 0;
       // The front pair could have been duplicated by a random pick so
       // check for it all the time nevertheless.
       if (is_idx1_best && is_idx2_best) {
@@ -1019,20 +1046,8 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
       }
       // Any pair containing one of the two best indices should only refer to
       // best_idx1. Its cost should also be updated.
-      if (is_idx1_best) {
-        p->idx1 = best_idx1;
-        do_eval = 1;
-      } else if (is_idx2_best) {
-        p->idx2 = best_idx1;
-        do_eval = 1;
-      }
-      // Make sure the index order is respected.
-      if (p->idx1 > p->idx2) {
-        const int tmp = p->idx2;
-        p->idx2 = p->idx1;
-        p->idx1 = tmp;
-      }
-      if (do_eval) {
+      if (is_idx1_best || is_idx2_best) {
+        HistoQueueFixPair(best_idx2, best_idx1, p);
         // Re-evaluate the cost of an updated pair.
         if (!HistoQueueUpdatePair(histograms[p->idx1], histograms[p->idx2], 0,
                                   p)) {
@@ -1040,17 +1055,17 @@ static int HistogramCombineStochastic(VP8LHistogramSet* const image_histo,
           continue;
         }
       }
+      HistoQueueFixPair(image_histo->size, best_idx2, p);
       HistoQueueUpdateHead(&histo_queue, p);
       ++j;
     }
     tries_with_no_success = 0;
   }
-  *do_greedy = (*num_used <= min_cluster_size);
+  *do_greedy = (image_histo->size <= min_cluster_size);
   ok = 1;
 
  End:
   HistoQueueClear(&histo_queue);
-  WebPSafeFree(mappings);
   return ok;
 }
 
@@ -1118,16 +1133,6 @@ static int32_t GetCombineCostFactor(int histo_size, int quality) {
   return combine_cost_factor;
 }
 
-static void RemoveEmptyHistograms(VP8LHistogramSet* const image_histo) {
-  uint32_t size;
-  int i;
-  for (i = 0, size = 0; i < image_histo->size; ++i) {
-    if (image_histo->histograms[i] == NULL) continue;
-    image_histo->histograms[size++] = image_histo->histograms[i];
-  }
-  image_histo->size = size;
-}
-
 int VP8LGetHistoImageSymbols(int xsize, int ysize,
                              const VP8LBackwardRefs* const refs, int quality,
                              int low_effort, int histogram_bits, int cache_bits,
@@ -1148,7 +1153,6 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
   // maximum quality q==100 (to preserve the compression gains at that level).
   const int entropy_combine_num_bins = low_effort ? NUM_PARTITIONS : BIN_SIZE;
   int entropy_combine;
-  int num_used = image_histo_raw_size;
   if (orig_histo == NULL) {
     WebPEncodingSetError(pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
     goto Error;
@@ -1156,11 +1160,9 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
 
   // Construct the histograms from backward references.
   HistogramBuild(xsize, histogram_bits, refs, orig_histo);
-  // Copies the histograms and computes its bit_cost.
-  // histogram_symbols is optimized
-  HistogramCopyAndAnalyze(orig_histo, image_histo, &num_used);
+  HistogramCopyAndAnalyze(orig_histo, image_histo);
   entropy_combine =
-      (num_used > entropy_combine_num_bins * 2) && (quality < 100);
+      (image_histo->size > entropy_combine_num_bins * 2) && (quality < 100);
 
   if (entropy_combine) {
     const int32_t combine_cost_factor =
@@ -1168,9 +1170,8 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
 
     HistogramAnalyzeEntropyBin(image_histo, low_effort);
     // Collapse histograms with similar entropy.
-    HistogramCombineEntropyBin(image_histo, &num_used, tmp_histo,
-                               entropy_combine_num_bins, combine_cost_factor,
-                               low_effort);
+    HistogramCombineEntropyBin(image_histo, tmp_histo, entropy_combine_num_bins,
+                               combine_cost_factor, low_effort);
   }
 
   // Don't combine the histograms using stochastic and greedy heuristics for
@@ -1181,14 +1182,12 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
         (int)(1 + DivRound(quality * quality * quality * (MAX_HISTO_GREEDY - 1),
                            100 * 100 * 100));
     int do_greedy;
-    if (!HistogramCombineStochastic(image_histo, &num_used, threshold_size,
-                                    &do_greedy)) {
+    if (!HistogramCombineStochastic(image_histo, threshold_size, &do_greedy)) {
       WebPEncodingSetError(pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
       goto Error;
     }
     if (do_greedy) {
-      RemoveEmptyHistograms(image_histo);
-      if (!HistogramCombineGreedy(image_histo, &num_used)) {
+      if (!HistogramCombineGreedy(image_histo)) {
         WebPEncodingSetError(pic, VP8_ENC_ERROR_OUT_OF_MEMORY);
         goto Error;
       }
@@ -1196,7 +1195,6 @@ int VP8LGetHistoImageSymbols(int xsize, int ysize,
   }
 
   // Find the optimal map from original histograms to the final ones.
-  RemoveEmptyHistograms(image_histo);
   HistogramRemap(orig_histo, image_histo, histogram_symbols);
 
   if (!WebPReportProgress(pic, *percent + percent_range, percent)) {
